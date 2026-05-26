@@ -61,6 +61,12 @@
   --color-sidebar-ring: var(--sidebar-ring);
 }
 
+@theme inline {
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-info: var(--info);
+}
+
 :root {
   --radius: 0.625rem;
   /* Dark scrape-bot dashboard */
