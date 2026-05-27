@@ -18,7 +18,7 @@ let settings = {
   timeout: 60000,
   retries: 2,
   screenshot: true,
-  autoReconnect: true,
+  autoReconnect: false,
 };
 
 export function updateSettings(patch) {
@@ -57,6 +57,18 @@ async function ensureBrowser(convId) {
 
 export async function connect(url, convId) {
   await ensureBrowser(convId);
+  // If already on the same host, don't re-navigate (keeps user session/state)
+  try {
+    const current = page.url();
+    const sameHost =
+      current && url && new URL(current).host === new URL(url).host;
+    if (sameHost) {
+      currentUrl = url;
+      lastConnectedAt = new Date().toISOString();
+      log("info", `Already on ${new URL(url).host}, skip navigation`, convId);
+      return getStatus();
+    }
+  } catch {}
   log("info", `Navigating to AI site: ${url}`, convId);
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: settings.timeout });
   currentUrl = url;
@@ -222,9 +234,18 @@ export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
     attempt++;
     try {
       await ensureBrowser(convId);
-      if (url && url !== currentUrl) {
-        await connect(url, convId);
-      } else if (!currentUrl && url) {
+      // Only navigate if we're not already on the right host
+      let needsNav = !currentUrl;
+      if (url && page && !page.isClosed()) {
+        try {
+          const current = page.url();
+          if (!current || current === "about:blank") needsNav = true;
+          else if (new URL(current).host !== new URL(url).host) needsNav = true;
+        } catch {
+          needsNav = true;
+        }
+      }
+      if (needsNav && url) {
         await connect(url, convId);
       }
 
@@ -259,9 +280,11 @@ export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
       await takeScreenshot("error", convId).then((s) => {
         if (s && onScreenshot) onScreenshot(s);
       });
-      if (settings.autoReconnect && attempt <= settings.retries) {
-        log("warn", `Reconnecting before retry…`, convId);
-        await closeBrowser().catch(() => {});
+      // Do NOT close the browser between retries — keeps user's login session alive.
+      // Only close if explicitly requested via closeBrowser().
+      if (attempt <= settings.retries) {
+        log("warn", `Retrying without closing browser…`, convId);
+        await page?.waitForTimeout?.(1000).catch(() => {});
       }
     }
   }
