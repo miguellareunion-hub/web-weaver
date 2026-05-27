@@ -1,6 +1,9 @@
 import express from "express";
 import cors from "cors";
 import http from "node:http";
+import multer from "multer";
+import path from "node:path";
+import fs from "node:fs";
 import {
   createTask,
   getTask,
@@ -24,6 +27,7 @@ import {
   updateSettings as updateChatSettings,
   closeBrowser as closeChatBrowser,
   readScreenshot,
+  downloadPath,
 } from "./chat/playwrightChat.js";
 import { initWs, broadcast } from "./chat/ws.js";
 
@@ -31,6 +35,20 @@ const PORT = process.env.PORT || 4000;
 const API_KEY = process.env.API_KEY || "";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const STARTED = Date.now();
+const DATA_DIR = process.env.DATA_DIR || "./data";
+const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+    filename: (_req, file, cb) => {
+      const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+      cb(null, `${Date.now()}-${safe}`);
+    },
+  }),
+  limits: { fileSize: 50 * 1024 * 1024, files: 10 },
+});
 
 const app = express();
 app.use(cors({ origin: CORS_ORIGIN }));
@@ -138,13 +156,24 @@ app.delete("/api/chat/conversations/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/chat/conversations/:id/message", async (req, res) => {
+app.post("/api/chat/conversations/:id/message", upload.array("files", 10), async (req, res) => {
   const conv = getConversation(req.params.id);
   if (!conv) return res.status(404).json({ error: "not found" });
   const { prompt, url } = req.body || {};
   if (!prompt) return res.status(400).json({ error: "prompt required" });
 
-  const userMsg = await appendMessage(conv.id, { role: "user", content: prompt });
+  const uploadedFiles = (req.files || []).map((f) => ({
+    name: f.originalname,
+    path: f.path,
+    url: `/api/chat/uploads/${path.basename(f.path)}`,
+    size: f.size,
+  }));
+
+  const userMsg = await appendMessage(conv.id, {
+    role: "user",
+    content: prompt,
+    attachments: uploadedFiles.map((f) => ({ name: f.name, url: f.url })),
+  });
   broadcast({ type: "chat:message", convId: conv.id, message: userMsg });
   broadcast({ type: "chat:typing", convId: conv.id, typing: true });
 
@@ -152,10 +181,11 @@ app.post("/api/chat/conversations/:id/message", async (req, res) => {
 
   try {
     const target = url || conv.url;
-    const { response, screenshot } = await sendPrompt({
+    const { response, screenshot, attachments } = await sendPrompt({
       url: target,
       prompt,
       convId: conv.id,
+      files: uploadedFiles.map((f) => f.path),
       onScreenshot: (s) =>
         broadcast({ type: "chat:screenshot", convId: conv.id, url: s }),
     });
@@ -166,6 +196,7 @@ app.post("/api/chat/conversations/:id/message", async (req, res) => {
       role: "assistant",
       content: response,
       screenshot,
+      attachments: attachments || [],
     });
     broadcast({ type: "chat:message", convId: conv.id, message: botMsg });
   } catch (e) {
@@ -187,6 +218,20 @@ app.get("/api/chat/screenshots/:filename", async (req, res) => {
   } catch {
     res.status(404).end();
   }
+});
+
+app.get("/api/chat/downloads/:filename", (req, res) => {
+  const file = downloadPath(req.params.filename);
+  res.download(file, (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
+});
+
+app.get("/api/chat/uploads/:filename", (req, res) => {
+  const file = path.join(UPLOAD_DIR, path.basename(req.params.filename));
+  res.download(file, (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
 });
 
 const server = http.createServer(app);

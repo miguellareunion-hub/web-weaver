@@ -6,8 +6,10 @@ import { log } from "../logger.js";
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const SHOT_DIR = path.join(DATA_DIR, "screenshots");
 const PROFILE_DIR = path.join(DATA_DIR, "browser-profile");
+const DOWNLOAD_DIR = path.join(DATA_DIR, "downloads");
 await fs.mkdir(SHOT_DIR, { recursive: true });
 await fs.mkdir(PROFILE_DIR, { recursive: true });
+await fs.mkdir(DOWNLOAD_DIR, { recursive: true });
 
 let context = null;
 let page = null;
@@ -46,6 +48,7 @@ async function ensureBrowser(convId) {
     headless: settings.headless,
     viewport: { width: 1280, height: 800 },
     args: ["--disable-blink-features=AutomationControlled"],
+    acceptDownloads: true,
   });
   const pages = context.pages();
   page = pages.length ? pages[0] : await context.newPage();
@@ -150,6 +153,90 @@ async function submitPrompt(target, prompt) {
 }
 
 /**
+ * Attach files to the prompt before sending.
+ * ChatGPT/most AI sites expose a hidden <input type="file">.
+ */
+async function attachFiles(filePaths, convId) {
+  if (!filePaths || filePaths.length === 0) return;
+  log("info", `Attaching ${filePaths.length} file(s)`, convId);
+  // Find a file input. Prefer one inside the composer/form.
+  const inputs = await page.$$('input[type="file"]');
+  if (inputs.length === 0) {
+    throw new Error("No file input found on page (cannot attach files)");
+  }
+  const input = inputs[inputs.length - 1];
+  await input.setInputFiles(filePaths);
+  // Wait for upload UI / thumbnail to appear and stabilize
+  await page.waitForTimeout(1500);
+  // Wait until send button enabled again (best-effort)
+  const sendSel =
+    'button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label*="Send" i], button[aria-label*="Envoyer" i]';
+  const start = Date.now();
+  while (Date.now() - start < 30000) {
+    const btn = await page.$(sendSel);
+    if (btn && (await btn.isEnabled().catch(() => false))) break;
+    await page.waitForTimeout(500);
+  }
+  log("success", `Files attached`, convId);
+}
+
+/**
+ * Scan the assistant node for downloadable links, click them to trigger
+ * Playwright downloads, save them locally, return attachments metadata.
+ */
+async function captureDownloads(node, convId) {
+  const attachments = [];
+  let links = [];
+  try {
+    links = await node.$$eval("a", (as) =>
+      as.map((a, i) => ({
+        i,
+        href: a.getAttribute("href") || "",
+        text: (a.innerText || a.textContent || "").trim(),
+        download: a.hasAttribute("download"),
+      })),
+    );
+  } catch {
+    return attachments;
+  }
+  const downloadable = links.filter(
+    (l) =>
+      l.download ||
+      /^sandbox:/i.test(l.href) ||
+      /^blob:/i.test(l.href) ||
+      /files\.oaiusercontent|cdn\.openai\.com|chatgpt\.com\/backend/i.test(
+        l.href,
+      ),
+  );
+  if (downloadable.length === 0) return attachments;
+  log("info", `Found ${downloadable.length} downloadable link(s)`, convId);
+  for (const link of downloadable) {
+    try {
+      const anchors = await node.$$("a");
+      const a = anchors[link.i];
+      if (!a) continue;
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: 20000 }),
+        a.click({ button: "left" }).catch(() => {}),
+      ]);
+      const suggested =
+        download.suggestedFilename() || link.text || `file-${Date.now()}`;
+      const safe = `${Date.now()}-${suggested.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+      const target = path.join(DOWNLOAD_DIR, safe);
+      await download.saveAs(target);
+      attachments.push({
+        name: suggested,
+        url: `/api/chat/downloads/${safe}`,
+      });
+      log("success", `Downloaded: ${suggested}`, convId);
+    } catch (e) {
+      log("warn", `Download failed for "${link.text}": ${e.message}`, convId);
+    }
+  }
+  return attachments;
+}
+
+/**
  * Wait until the assistant response text stops growing (streaming finished).
  * Strategy:
  *  1. Wait for a NEW assistant message node to appear (count increases).
@@ -227,7 +314,7 @@ async function waitForResponse(convId, prevAssistantCount) {
  * Send a prompt and return the AI's response text.
  * Emits progress via the onLog callback.
  */
-export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
+export async function sendPrompt({ url, prompt, convId, files, onScreenshot }) {
   let attempt = 0;
   let lastErr;
   while (attempt <= settings.retries) {
@@ -265,6 +352,10 @@ export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
       if (beforeShot && onScreenshot) onScreenshot(beforeShot);
 
       log("info", `Typing prompt into ${target.selector}`, convId);
+      // Attach files BEFORE typing/submitting so they get uploaded
+      if (files && files.length) {
+        await attachFiles(files, convId);
+      }
       await submitPrompt(target, prompt);
       log("info", `Prompt sent, waiting for response…`, convId);
 
@@ -273,7 +364,21 @@ export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
       const afterShot = await takeScreenshot("after", convId);
       if (afterShot && onScreenshot) onScreenshot(afterShot);
 
-      return { response, screenshot: afterShot };
+      // Try to capture any downloadable files in the latest assistant node
+      let attachments = [];
+      try {
+        const els = await page.$$(
+          '[data-message-author-role="assistant"], div.markdown, div.prose',
+        );
+        const lastNode = els[els.length - 1];
+        if (lastNode) {
+          attachments = await captureDownloads(lastNode, convId);
+        }
+      } catch (e) {
+        log("warn", `Download capture failed: ${e.message}`, convId);
+      }
+
+      return { response, screenshot: afterShot, attachments };
     } catch (err) {
       lastErr = err;
       log("error", `Attempt ${attempt} failed: ${err.message}`, convId);
@@ -302,4 +407,8 @@ export async function closeBrowser() {
 export async function readScreenshot(filename) {
   const safe = path.basename(filename);
   return fs.readFile(path.join(SHOT_DIR, safe));
+}
+
+export function downloadPath(filename) {
+  return path.join(DOWNLOAD_DIR, path.basename(filename));
 }

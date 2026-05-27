@@ -1,5 +1,10 @@
 import { useSettings } from "./store";
 
+export interface ChatAttachment {
+  name: string;
+  url: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -7,6 +12,7 @@ export interface ChatMessage {
   timestamp: string;
   screenshot?: string;
   error?: boolean;
+  attachments?: ChatAttachment[];
 }
 
 export interface Conversation {
@@ -86,6 +92,27 @@ export const chatApi = {
       method: "POST",
       body: JSON.stringify({ prompt, url }),
     }),
+  sendWithFiles: async (
+    id: string,
+    prompt: string,
+    url: string | undefined,
+    files: File[],
+  ) => {
+    const fd = new FormData();
+    fd.append("prompt", prompt);
+    if (url) fd.append("url", url);
+    for (const f of files) fd.append("files", f, f.name);
+    const { apiKey } = useSettings.getState();
+    const headers: Record<string, string> = {};
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+    const r = await fetch(`${base()}/api/chat/conversations/${id}/message`, {
+      method: "POST",
+      headers,
+      body: fd,
+    });
+    if (!r.ok) throw new Error(`${r.status} ${await r.text().catch(() => r.statusText)}`);
+    return r.json();
+  },
 };
 
 export function chatWsUrl(): string {
@@ -95,6 +122,11 @@ export function chatWsUrl(): string {
 
 export function resolveScreenshot(url: string | undefined): string | undefined {
   if (!url) return undefined;
+  if (url.startsWith("http")) return url;
+  return `${base()}${url}`;
+}
+
+export function resolveAttachment(url: string): string {
   if (url.startsWith("http")) return url;
   return `${base()}${url}`;
 }
