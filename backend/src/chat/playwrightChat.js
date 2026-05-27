@@ -186,38 +186,42 @@ async function attachFiles(filePaths, convId) {
  */
 async function captureDownloads(node, convId) {
   const attachments = [];
-  let links = [];
+  let candidates = [];
   try {
-    links = await node.$$eval("a", (as) =>
-      as.map((a, i) => ({
+    candidates = await node.$$eval("a, button", (els) =>
+      els.map((el, i) => ({
         i,
-        href: a.getAttribute("href") || "",
-        text: (a.innerText || a.textContent || "").trim(),
-        download: a.hasAttribute("download"),
+        tag: el.tagName.toLowerCase(),
+        href: el.getAttribute("href") || "",
+        text: (el.innerText || el.textContent || "").trim(),
+        download: el.hasAttribute && el.hasAttribute("download"),
       })),
     );
   } catch {
     return attachments;
   }
-  const downloadable = links.filter(
+  const textIsDownload = (t) =>
+    /t[ée]l[ée]charger|download|télécharge/i.test(t);
+  const downloadable = candidates.filter(
     (l) =>
       l.download ||
       /^sandbox:/i.test(l.href) ||
       /^blob:/i.test(l.href) ||
       /files\.oaiusercontent|cdn\.openai\.com|chatgpt\.com\/backend/i.test(
         l.href,
-      ),
+      ) ||
+      textIsDownload(l.text),
   );
   if (downloadable.length === 0) return attachments;
-  log("info", `Found ${downloadable.length} downloadable link(s)`, convId);
+  log("info", `Found ${downloadable.length} downloadable element(s)`, convId);
   for (const link of downloadable) {
     try {
-      const anchors = await node.$$("a");
-      const a = anchors[link.i];
-      if (!a) continue;
+      const els = await node.$$("a, button");
+      const el = els[link.i];
+      if (!el) continue;
       const [download] = await Promise.all([
         page.waitForEvent("download", { timeout: 20000 }),
-        a.click({ button: "left" }).catch(() => {}),
+        el.click({ button: "left" }).catch(() => {}),
       ]);
       const suggested =
         download.suggestedFilename() || link.text || `file-${Date.now()}`;
