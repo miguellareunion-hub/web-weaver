@@ -7,11 +7,13 @@ import {
   ListChecks,
   Settings,
   Bot,
+  MessageSquare,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const items = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/chat", label: "AI Chat", icon: MessageSquare },
   { to: "/tasks", label: "Tâches", icon: ListChecks },
   { to: "/logs", label: "Logs", icon: Terminal },
   { to: "/results", label: "Résultats", icon: Database },
