@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { broadcast } from "./chat/ws.js";
 
 const MAX = 2000;
 const buffer = [];
@@ -15,6 +16,7 @@ export function log(level, message, taskId) {
   if (buffer.length > MAX) buffer.shift();
   const fn = level === "error" ? console.error : console.log;
   fn(`[${entry.timestamp}] ${level.toUpperCase()} ${taskId ?? "-"} ${message}`);
+  try { broadcast({ type: "log", log: entry }); } catch {}
   return entry;
 }
 
