@@ -266,7 +266,7 @@ async function waitForResponse(convId, prevAssistantCount) {
   while (Date.now() - start < maxWait) {
     nodes = await getAssistantNodes();
     if (nodes.els.length > prevAssistantCount) break;
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(150);
   }
   if (nodes.els.length <= prevAssistantCount) {
     throw new Error("No new assistant message appeared (login required?)");
@@ -280,7 +280,7 @@ async function waitForResponse(convId, prevAssistantCount) {
     const fresh = await getAssistantNodes();
     const node = fresh.els[fresh.els.length - 1];
     if (!node) {
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(150);
       continue;
     }
     const text = (await node.innerText().catch(() => "")).trim();
@@ -293,7 +293,7 @@ async function waitForResponse(convId, prevAssistantCount) {
 
     if (text && text === last && !streaming) {
       stable++;
-      if (stable >= 3) {
+      if (stable >= 2) {
         log("success", `Response stable after ${Date.now() - start}ms`, convId);
         return text;
       }
@@ -301,7 +301,7 @@ async function waitForResponse(convId, prevAssistantCount) {
       stable = 0;
       last = text || last;
     }
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(200);
   }
   if (last) {
     log("warn", `Response timed out, returning partial`, convId);
