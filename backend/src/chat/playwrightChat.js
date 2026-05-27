@@ -5,9 +5,10 @@ import { log } from "../logger.js";
 
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const SHOT_DIR = path.join(DATA_DIR, "screenshots");
+const PROFILE_DIR = path.join(DATA_DIR, "browser-profile");
 await fs.mkdir(SHOT_DIR, { recursive: true });
+await fs.mkdir(PROFILE_DIR, { recursive: true });
 
-let browser = null;
 let context = null;
 let page = null;
 let currentUrl = "";
@@ -35,13 +36,23 @@ export function getStatus() {
 }
 
 async function ensureBrowser(convId) {
-  if (browser && page && !page.isClosed()) return;
-  log("info", `Launching browser (headless=${settings.headless})`, convId);
-  browser = await chromium.launch({ headless: settings.headless });
-  context = await browser.newContext({
+  if (context && page && !page.isClosed()) return;
+  log(
+    "info",
+    `Launching persistent browser (headless=${settings.headless}, profile=${PROFILE_DIR})`,
+    convId,
+  );
+  context = await chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: settings.headless,
     viewport: { width: 1280, height: 800 },
+    args: ["--disable-blink-features=AutomationControlled"],
   });
-  page = await context.newPage();
+  const pages = context.pages();
+  page = pages.length ? pages[0] : await context.newPage();
+  context.on("close", () => {
+    context = null;
+    page = null;
+  });
 }
 
 export async function connect(url, convId) {
@@ -73,11 +84,15 @@ async function takeScreenshot(label, convId) {
  */
 async function findPromptInput() {
   const candidates = [
+    '#prompt-textarea',
+    'div#prompt-textarea[contenteditable="true"]',
     'textarea[data-id="root"]',
     'textarea[placeholder*="Message" i]',
     'textarea[placeholder*="Ask" i]',
     'textarea[placeholder*="Send" i]',
     'textarea[placeholder*="Saisis" i]',
+    'textarea[placeholder*="Pose" i]',
+    'textarea[placeholder*="Demande" i]',
     'div[contenteditable="true"][role="textbox"]',
     'div[contenteditable="true"]',
     'textarea',
@@ -94,16 +109,19 @@ async function findPromptInput() {
 }
 
 async function submitPrompt(target, prompt) {
+  // Focus first
+  await target.handle.click().catch(() => {});
   // Try fill (textarea/input), fallback to keyboard type for contenteditable
   try {
     await target.handle.fill(prompt);
   } catch {
-    await target.handle.click();
     await page.keyboard.type(prompt, { delay: 5 });
   }
+  await page.waitForTimeout(150);
   // Try clicking a send button first
   const sendSelectors = [
     'button[data-testid="send-button"]',
+    'button[data-testid="composer-send-button"]',
     'button[aria-label*="Send" i]',
     'button[aria-label*="Envoyer" i]',
     'button[type="submit"]',
@@ -121,43 +139,68 @@ async function submitPrompt(target, prompt) {
 
 /**
  * Wait until the assistant response text stops growing (streaming finished).
+ * Strategy:
+ *  1. Wait for a NEW assistant message node to appear (count increases).
+ *  2. Poll its innerText until it stops changing for ~1.5s OR a "stop"
+ *     button reverts to a "send" button (streaming finished).
  */
-async function waitForResponse(convId, beforeText) {
+async function waitForResponse(convId, prevAssistantCount) {
   const start = Date.now();
   const maxWait = settings.timeout;
-  let last = "";
-  let stable = 0;
-  const targets = [
+  const assistantSelectors = [
     '[data-message-author-role="assistant"]',
-    '.markdown',
+    'div.markdown',
     'div.prose',
-    'article',
-    'main',
+    'article[data-testid^="conversation-turn"]',
   ];
 
-  while (Date.now() - start < maxWait) {
-    let text = "";
-    for (const sel of targets) {
-      const els = await page.$$(sel);
-      if (els.length) {
-        // Take last element text
-        const t = await els[els.length - 1].innerText().catch(() => "");
-        if (t && t.length > text.length) text = t;
-      }
+  async function getAssistantNodes() {
+    for (const sel of assistantSelectors) {
+      const els = await page.$$(sel).catch(() => []);
+      if (els.length) return { sel, els };
     }
-    // Strip the user prompt + prior conversation from text
-    const clean = text.trim();
-    if (clean && clean !== beforeText && clean.length > 0) {
-      if (clean === last) {
-        stable++;
-        if (stable >= 4) {
-          log("success", `Response stable after ${Date.now() - start}ms`, convId);
-          return clean;
-        }
-      } else {
-        stable = 0;
-        last = clean;
+    return { sel: null, els: [] };
+  }
+
+  // 1. Wait for a NEW assistant message to appear
+  let nodes = { sel: null, els: [] };
+  while (Date.now() - start < maxWait) {
+    nodes = await getAssistantNodes();
+    if (nodes.els.length > prevAssistantCount) break;
+    await page.waitForTimeout(400);
+  }
+  if (nodes.els.length <= prevAssistantCount) {
+    throw new Error("No new assistant message appeared (login required?)");
+  }
+  log("info", `Assistant message detected, waiting for stream…`, convId);
+
+  // 2. Poll last node until text is stable AND no "stop" button visible
+  let last = "";
+  let stable = 0;
+  while (Date.now() - start < maxWait) {
+    const fresh = await getAssistantNodes();
+    const node = fresh.els[fresh.els.length - 1];
+    if (!node) {
+      await page.waitForTimeout(400);
+      continue;
+    }
+    const text = (await node.innerText().catch(() => "")).trim();
+
+    // Detect stop/streaming button
+    const stopBtn = await page.$(
+      'button[aria-label*="Stop" i], button[data-testid="stop-button"], button[data-testid="composer-stop-button"], button[aria-label*="Arrêter" i], button[aria-label*="Arreter" i]',
+    );
+    const streaming = !!stopBtn && (await stopBtn.isVisible().catch(() => false));
+
+    if (text && text === last && !streaming) {
+      stable++;
+      if (stable >= 3) {
+        log("success", `Response stable after ${Date.now() - start}ms`, convId);
+        return text;
       }
+    } else {
+      stable = 0;
+      last = text || last;
     }
     await page.waitForTimeout(500);
   }
@@ -189,9 +232,13 @@ export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
       const target = await findPromptInput();
       if (!target) throw new Error("No prompt input found on page");
 
-      const before = await page
-        .innerText("body")
-        .catch(() => "");
+      // Count existing assistant messages so we can detect the NEW one
+      const prevCount = await page
+        .$$eval(
+          '[data-message-author-role="assistant"], div.markdown, div.prose',
+          (els) => els.length,
+        )
+        .catch(() => 0);
 
       const beforeShot = await takeScreenshot("before", convId);
       if (beforeShot && onScreenshot) onScreenshot(beforeShot);
@@ -200,7 +247,7 @@ export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
       await submitPrompt(target, prompt);
       log("info", `Prompt sent, waiting for response…`, convId);
 
-      const response = await waitForResponse(convId, before);
+      const response = await waitForResponse(convId, prevCount);
 
       const afterShot = await takeScreenshot("after", convId);
       if (afterShot && onScreenshot) onScreenshot(afterShot);
@@ -222,10 +269,9 @@ export async function sendPrompt({ url, prompt, convId, onScreenshot }) {
 }
 
 export async function closeBrowser() {
-  if (browser) {
-    await browser.close().catch(() => {});
+  if (context) {
+    await context.close().catch(() => {});
   }
-  browser = null;
   context = null;
   page = null;
 }
