@@ -237,6 +237,134 @@ async function captureDownloads(node, convId) {
 }
 
 /**
+ * ChatGPT renders code/documents in a side "Canvas" panel that is OUTSIDE
+ * the assistant message node. When the assistant text is short and looks
+ * like "C'est créé dans le canvas", we extract the canvas content and
+ * trigger its download button.
+ */
+async function captureCanvas(convId) {
+  const canvasSelectors = [
+    '[data-testid*="canvas" i]',
+    'section[aria-label*="canvas" i]',
+    'aside[aria-label*="canvas" i]',
+    'div[class*="canvas" i]',
+    'div[role="complementary"]',
+  ];
+  let canvas = null;
+  for (const sel of canvasSelectors) {
+    const els = await page.$$(sel).catch(() => []);
+    for (const el of els) {
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) continue;
+      // Must contain a code-like block to qualify
+      const hasCode = await el
+        .$('.cm-content, pre code, pre, code, textarea')
+        .catch(() => null);
+      if (hasCode) {
+        canvas = el;
+        break;
+      }
+    }
+    if (canvas) break;
+  }
+  if (!canvas) return { text: "", attachments: [] };
+
+  log("info", `Canvas detected, extracting content…`, convId);
+
+  // Extract title (e.g. "Page Pere Noel Danse")
+  let title = "";
+  try {
+    title = (
+      await canvas
+        .$eval(
+          'h1, h2, [class*="title" i], [data-testid*="title" i]',
+          (el) => el.innerText || el.textContent || "",
+        )
+        .catch(() => "")
+    ).trim();
+  } catch {}
+
+  // Extract language hint
+  let lang = "";
+  try {
+    lang = (
+      await canvas
+        .$eval(
+          '[class*="language-"], [data-language]',
+          (el) =>
+            el.getAttribute("data-language") ||
+            (el.className.match(/language-([a-z0-9]+)/i)?.[1] ?? ""),
+        )
+        .catch(() => "")
+    ).trim();
+  } catch {}
+
+  // Extract the code body. CodeMirror uses .cm-content with virtualized lines.
+  let code = "";
+  try {
+    const cm = await canvas.$(".cm-content");
+    if (cm) {
+      code = (await cm.innerText().catch(() => "")) || "";
+    }
+  } catch {}
+  if (!code) {
+    try {
+      const pre = await canvas.$("pre");
+      if (pre) code = (await pre.innerText().catch(() => "")) || "";
+    } catch {}
+  }
+  if (!code) {
+    try {
+      const ta = await canvas.$("textarea");
+      if (ta) code = (await ta.inputValue().catch(() => "")) || "";
+    } catch {}
+  }
+  code = code.trim();
+
+  // Build markdown block
+  let text = "";
+  if (title) text += `**${title}**\n\n`;
+  if (code) text += "```" + (lang || "") + "\n" + code + "\n```";
+
+  // Try to click "Télécharger" / "Download" to grab the file
+  const attachments = [];
+  const dlSelectors = [
+    'button:has-text("Télécharger")',
+    'button:has-text("Telecharger")',
+    'button:has-text("Download")',
+    '[role="menuitem"]:has-text("Télécharger")',
+    '[role="menuitem"]:has-text("Download")',
+    'a:has-text("Télécharger")',
+    'a:has-text("Download")',
+  ];
+  for (const sel of dlSelectors) {
+    const btn = await canvas.$(sel).catch(() => null);
+    if (!btn) continue;
+    try {
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout: 15000 }),
+        btn.click().catch(() => {}),
+      ]);
+      const suggested =
+        download.suggestedFilename() || title || `canvas-${Date.now()}.txt`;
+      const safe = `${Date.now()}-${suggested.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+      const target = path.join(DOWNLOAD_DIR, safe);
+      await download.saveAs(target);
+      attachments.push({
+        name: suggested,
+        url: `/api/chat/downloads/${safe}`,
+      });
+      log("success", `Canvas downloaded: ${suggested}`, convId);
+      break;
+    } catch (e) {
+      log("warn", `Canvas download via "${sel}" failed: ${e.message}`, convId);
+    }
+  }
+
+  return { text, attachments };
+}
+
+/**
  * Wait until the assistant response text stops growing (streaming finished).
  * Strategy:
  *  1. Wait for a NEW assistant message node to appear (count increases).
@@ -378,7 +506,24 @@ export async function sendPrompt({ url, prompt, convId, files, onScreenshot }) {
         log("warn", `Download capture failed: ${e.message}`, convId);
       }
 
-      return { response, screenshot: afterShot, attachments };
+      // ChatGPT Canvas: code/documents live in a side panel, not in the
+      // assistant text. Extract its content and trigger its download.
+      let finalResponse = response;
+      try {
+        const canvas = await captureCanvas(convId);
+        if (canvas.text) {
+          finalResponse = response
+            ? `${response}\n\n${canvas.text}`
+            : canvas.text;
+        }
+        if (canvas.attachments.length) {
+          attachments = [...attachments, ...canvas.attachments];
+        }
+      } catch (e) {
+        log("warn", `Canvas capture failed: ${e.message}`, convId);
+      }
+
+      return { response: finalResponse, screenshot: afterShot, attachments };
     } catch (err) {
       lastErr = err;
       log("error", `Attempt ${attempt} failed: ${err.message}`, convId);
