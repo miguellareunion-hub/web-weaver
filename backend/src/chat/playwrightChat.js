@@ -506,7 +506,24 @@ export async function sendPrompt({ url, prompt, convId, files, onScreenshot }) {
         log("warn", `Download capture failed: ${e.message}`, convId);
       }
 
-      return { response, screenshot: afterShot, attachments };
+      // ChatGPT Canvas: code/documents live in a side panel, not in the
+      // assistant text. Extract its content and trigger its download.
+      let finalResponse = response;
+      try {
+        const canvas = await captureCanvas(convId);
+        if (canvas.text) {
+          finalResponse = response
+            ? `${response}\n\n${canvas.text}`
+            : canvas.text;
+        }
+        if (canvas.attachments.length) {
+          attachments = [...attachments, ...canvas.attachments];
+        }
+      } catch (e) {
+        log("warn", `Canvas capture failed: ${e.message}`, convId);
+      }
+
+      return { response: finalResponse, screenshot: afterShot, attachments };
     } catch (err) {
       lastErr = err;
       log("error", `Attempt ${attempt} failed: ${err.message}`, convId);
