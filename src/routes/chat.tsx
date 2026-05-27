@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import {
   chatApi,
   resolveScreenshot,
+  resolveAttachment,
   type ChatMessage,
   type Conversation,
   type ConversationSummary,
@@ -26,6 +27,9 @@ import {
   Bot,
   User,
   Image as ImageIcon,
+  Paperclip,
+  X as XIcon,
+  FileIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -48,6 +52,8 @@ function ChatPage() {
   const [typing, setTyping] = useState(false);
   const [status, setStatus] = useState<ChatStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  const [files, setFiles] = useState<File[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   async function reloadList() {
@@ -152,7 +158,7 @@ function ChatPage() {
   }
 
   async function send() {
-    if (!prompt.trim()) return;
+    if (!prompt.trim() && files.length === 0) return;
     let conv = active;
     if (!conv) {
       conv = await chatApi.create({ url });
@@ -161,9 +167,15 @@ function ChatPage() {
     setBusy(true);
     setTyping(true);
     const p = prompt;
+    const f = files;
     setPrompt("");
+    setFiles([]);
     try {
-      await chatApi.send(conv.id, p, url);
+      if (f.length > 0) {
+        await chatApi.sendWithFiles(conv.id, p, url, f);
+      } else {
+        await chatApi.send(conv.id, p, url);
+      }
       await reloadList();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Envoi impossible");
@@ -313,7 +325,51 @@ function ChatPage() {
 
         {/* Composer */}
         <div className="p-3 border-t border-border">
+          {files.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {files.map((f, i) => (
+                <div
+                  key={i}
+                  className="flex items-center gap-1.5 bg-muted rounded-md px-2 py-1 text-xs"
+                >
+                  <FileIcon className="w-3 h-3 text-muted-foreground" />
+                  <span className="truncate max-w-[180px]">{f.name}</span>
+                  <span className="text-muted-foreground">
+                    {(f.size / 1024).toFixed(0)}ko
+                  </span>
+                  <button
+                    onClick={() => setFiles(files.filter((_, j) => j !== i))}
+                    className="text-muted-foreground hover:text-destructive"
+                  >
+                    <XIcon className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="flex gap-2 items-end">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                const list = Array.from(e.target.files || []);
+                if (list.length) setFiles((cur) => [...cur, ...list]);
+                if (fileInputRef.current) fileInputRef.current.value = "";
+              }}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="h-[60px] w-[44px] shrink-0"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={busy}
+              title="Joindre des fichiers"
+            >
+              <Paperclip className="w-4 h-4" />
+            </Button>
             <Textarea
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
@@ -329,7 +385,7 @@ function ChatPage() {
             />
             <Button
               onClick={send}
-              disabled={busy || !prompt.trim()}
+              disabled={busy || (!prompt.trim() && files.length === 0)}
               className="bg-[image:var(--gradient-primary)] text-primary-foreground h-[60px] px-5"
             >
               {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
@@ -374,6 +430,23 @@ function MessageBubble({ m }: { m: ChatMessage }) {
             </div>
           )}
         </div>
+        {m.attachments && m.attachments.length > 0 && (
+          <div className={cn("flex flex-wrap gap-1.5", isUser && "justify-end")}>
+            {m.attachments.map((a, i) => (
+              <a
+                key={i}
+                href={resolveAttachment(a.url)}
+                target="_blank"
+                rel="noreferrer"
+                download
+                className="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-md border border-border bg-card hover:bg-muted text-foreground"
+              >
+                <Download className="w-3 h-3" />
+                {a.name}
+              </a>
+            ))}
+          </div>
+        )}
         {m.screenshot && (
           <a
             href={resolveScreenshot(m.screenshot)}
